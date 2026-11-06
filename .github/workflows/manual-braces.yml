@@ -1,0 +1,142 @@
+name: Manual JavaParser braces check
+
+on:
+  workflow_dispatch:
+    inputs:
+      check:
+        description: 'all initially; select only the failed check for a retry'
+        type: choice
+        required: true
+        default: all
+        options: [all, tests8, tests21, style]
+      failed_test:
+        description: 'Optional fully qualified failed test class or class#method; use with tests8/tests21'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    if: inputs.check != 'style'
+    name: Core tests - JDK ${{ matrix.java }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ${{ fromJSON(inputs.check == 'tests8' && '["8"]' || inputs.check == 'tests21' && '["21"]' || '["8","21"]') }}
+    env:
+      MAVEN_OPTS: -Xmx4g
+      SELECTED_CHECK: ${{ inputs.check }}
+      FAILED_TEST: ${{ inputs.failed_test }}
+      EXPECTED_JAVA: ${{ matrix.java }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - name: Record checked source
+        run: |
+          git rev-parse HEAD | tee checked-sha.txt
+          java -version
+      - name: Run core tests
+        shell: bash
+        run: |
+          set -o pipefail
+          test_args=()
+          if [[ -n "$FAILED_TEST" ]]; then
+            test_pattern='^com\.github\.javaparser\.[A-Za-z0-9_.$]+(#[A-Za-z0-9_$*]+)?$'
+            if [[ "$SELECTED_CHECK" == 'all' || ! "$FAILED_TEST" =~ $test_pattern ]]; then
+              echo 'For a retry, select tests8 or tests21 and one fully qualified test class/method.'
+              exit 1
+            fi
+            test_args+=("-Dtest=$FAILED_TEST" "-Dsurefire.failIfNoSpecifiedTests=false")
+          fi
+          ./mvnw -B -V --no-transfer-progress -DskipTests=false \
+            -pl javaparser-core-testing -am "${test_args[@]}" test 2>&1 | tee core-tests.log
+      - name: Verify actual test execution
+        run: |
+          python3 - <<'PY'
+          import glob, json, os, xml.etree.ElementTree as ET
+          reports = glob.glob('javaparser-core-testing/target/surefire-reports/TEST-*.xml')
+          assert reports, 'No JUnit reports found'
+          totals = dict(tests=0, failures=0, errors=0, skipped=0)
+          javadoc_cases = 0
+          expected_java = '1.8' if os.environ['EXPECTED_JAVA'] == '8' else '21'
+          for path in reports:
+              suite = ET.parse(path).getroot()
+              for key in totals:
+                  totals[key] += int(suite.get(key, '0'))
+              props = {p.get('name'): p.get('value') for p in suite.findall('./properties/property')}
+              assert props.get('java.specification.version') == expected_java, props.get('java.version')
+              if suite.get('name') == 'com.github.javaparser.javadoc.JavadocTest':
+                  javadoc_cases = int(suite.get('tests', '0'))
+          totals['passed'] = totals['tests'] - totals['failures'] - totals['errors'] - totals['skipped']
+          assert totals['passed'] > 0 and totals['failures'] == 0 and totals['errors'] == 0, totals
+          if not os.environ['FAILED_TEST']:
+              assert javadoc_cases >= 25, 'Javadoc regression tests did not run'
+          summary = dict(java=expected_java, reports=len(reports), javadoc_cases=javadoc_cases, **totals)
+          print(json.dumps(summary, indent=2))
+          with open('test-summary.json', 'w') as out:
+              json.dump(summary, out, indent=2)
+          PY
+          git diff --exit-code
+      - name: Save test evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: javaparser-core-jdk${{ matrix.java }}
+          retention-days: 1
+          if-no-files-found: warn
+          path: |
+            checked-sha.txt
+            core-tests.log
+            test-summary.json
+            javaparser-core-testing/target/surefire-reports/TEST-*.xml
+            javaparser-core-testing/target/surefire-reports/*.txt
+
+  style:
+    if: inputs.check == 'all' || inputs.check == 'style'
+    name: Generators and style - JDK 11
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      MAVEN_OPTS: -Xmx4g
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '11'
+      - name: Record checked source
+        run: |
+          git rev-parse HEAD | tee checked-sha.txt
+          java -version
+      - name: Checkstyle on fresh sources
+        run: |
+          set -o pipefail
+          ./mvnw -B -V --no-transfer-progress checkstyle:check 2>&1 | tee checkstyle.log
+      - name: Verify generators and formatting
+        run: |
+          set -o pipefail
+          ./run_core_metamodel_generator.sh 2>&1 | tee metamodel.log
+          ./run_core_generators.sh 2>&1 | tee generators.log
+          ./mvnw -B --no-transfer-progress spotless:check 2>&1 | tee spotless.log
+          git diff --exit-code
+      - name: Save style evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: javaparser-style-jdk11
+          retention-days: 1
+          if-no-files-found: warn
+          path: |
+            checked-sha.txt
+            checkstyle.log
+            metamodel.log
+            generators.log
+            spotless.log
